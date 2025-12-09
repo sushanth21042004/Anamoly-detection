@@ -20,7 +20,7 @@ except ImportError:
 try:
     from scapy.all import sniff, IP, TCP, UDP, DNS, conf
     SCAPY_AVAILABLE = True
-except ImportError:
+except Exception:
     SCAPY_AVAILABLE = False
 
 # --- CONFIGURATION ---
@@ -52,8 +52,9 @@ def train_and_save_model():
     print("    [1/4] Learning Normal Traffic Profiles (w/ Headers)...")
     
     # 1. REALISTIC NORMAL TRAFFIC (Label 0)
+    # REDUCED SIZE FOR VERCEL TIMEOUT PREVENTION
     X_normal = []
-    for _ in range(20000):
+    for _ in range(500):
         r = np.random.random()
         if r < 0.3: # TCP
             pkt_len = int(np.random.normal(800, 200)) + 54
@@ -74,7 +75,7 @@ def train_and_save_model():
     
     # 2. ATTACK TRAFFIC (Label 1)
     X_attack = []
-    for _ in range(20000):
+    for _ in range(500):
         r = np.random.random()
         if r < 0.4: # MALFORMED
             pkt_len = int(np.random.uniform(200, 1100)) 
