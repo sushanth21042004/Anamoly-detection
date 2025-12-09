@@ -28,7 +28,6 @@ else:
         SCAPY_AVAILABLE = False
 
 # --- CONFIGURATION ---
-# Look for bundled model first, fall back to tmp only if needed
 BUNDLED_MODEL = os.path.join(os.path.dirname(__file__), "model.pkl")
 MODEL_FILE = "/tmp/netguard_model.pkl" 
 MAX_HISTORY = 100
@@ -37,7 +36,7 @@ MAX_HISTORY = 100
 class AppState:
     def __init__(self):
         self.status = "IDLE" 
-        self.mode = "REAL" # or "DEMO"
+        self.mode = "REAL" 
         self.training_progress = 100 
         self.traffic_data = deque(maxlen=MAX_HISTORY)
         self.recent_packets = deque(maxlen=15)
@@ -52,18 +51,44 @@ class AppState:
 state = AppState()
 app = Flask(__name__)
 
-# --- DUMMY MODEL (FALLBACK) ---
-class DummyModel:
-    def predict_proba(self, X):
-        return [[0.1, 0.9]] if random.random() < 0.1 else [[0.9, 0.1]]
+# --- INTERNAL TRAINING ENGINE (Local Fallback) ---
+def train_and_save_model():
+    # Only run this if absolutely necessary (e.g. local first run without bundle)
+    print("\n--- 🧠 CALIBRATING AI (Local Mode) ---")
+    
+    X_normal = []
+    for _ in range(500):
+        r = np.random.random()
+        if r < 0.3: pkt_len = int(np.random.normal(800, 200)) + 54; proto = 6; is_dns = 0
+        elif r < 0.6: pkt_len = int(np.random.uniform(2000, 20000)); proto = 6; is_dns = 0
+        elif r < 0.9: pkt_len = int(np.random.normal(1400, 20)) + 42; proto = 17; is_dns = 0
+        else: pkt_len = int(np.random.normal(80, 20)); proto = 17; is_dns = 1
+        payload_len = max(0, pkt_len - 54)
+        X_normal.append([pkt_len, proto, is_dns, payload_len])
+    
+    X_attack = []
+    for _ in range(500):
+        r = np.random.random()
+        if r < 0.4: pkt_len = int(np.random.uniform(200, 1100)); proto = 17; is_dns = 0 
+        elif r < 0.8: pkt_len = int(np.random.randint(20, 50)); proto = np.random.choice([6, 17]); is_dns = 0
+        else: pkt_len = int(np.random.randint(25000, 65000)); proto = 17; is_dns = 0
+        payload_len = max(0, pkt_len - 54)
+        X_attack.append([pkt_len, proto, is_dns, payload_len])
 
-class DummyScaler:
-    def transform(self, X):
-        return X
+    X = np.array(X_normal + X_attack)
+    y = np.array([0]*len(X_normal) + [1]*len(X_attack)) 
+    
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    
+    clf = RandomForestClassifier(n_estimators=50, max_depth=10, random_state=42)
+    clf.fit(X_scaled, y)
+    
+    return clf, scaler
 
 # --- LOAD MODEL ---
 def load_ai_model():
-    # 1. Try Bundled Model
+    # 1. Try Bundled Model (Preferred for Cloud)
     if os.path.exists(BUNDLED_MODEL):
         try:
             with open(BUNDLED_MODEL, "rb") as f:
@@ -76,7 +101,7 @@ def load_ai_model():
         except Exception as e:
             print(f"[!] Bundled model error: {e}")
 
-    # 2. Try /tmp Model (Previous runs)
+    # 2. Try Local Cache
     if os.path.exists(MODEL_FILE):
         try:
             with open(MODEL_FILE, "rb") as f:
@@ -88,11 +113,14 @@ def load_ai_model():
                 return
         except: pass
     
-    # 3. Last Resort: Dummy Model (Prevent Crash on Read-Only/Timeout)
-    print("[!] Using Dummy Model (Fallback)")
-    state.model = DummyModel()
-    state.scaler = DummyScaler()
-    state.status = "ACTIVE"
+    # 3. Train (Only if writable/local)
+    # On Vercel this might timeout or fail, which is expected behavior if bundle fails.
+    try:
+        state.model, state.scaler = train_and_save_model()
+        state.status = "ACTIVE"
+    except Exception as e:
+        print(f"[!] Model initialization failed: {e}")
+        state.status = "ERROR"
 
 # --- FEATURE ENGINEERING ---
 def extract_features(packet):
@@ -110,6 +138,7 @@ def extract_features(packet):
 # --- PROCESSOR ---
 def process_data(features, summary_info):
     if state.stop_signal or state.status != "ACTIVE": return
+    if state.model is None or state.scaler is None: return
 
     with state.lock:
         state.packet_count += 1
@@ -144,16 +173,16 @@ def process_data(features, summary_info):
 # --- THREADS ---
 def sniffer_thread():
     if not SCAPY_AVAILABLE:
-        print("Scapy not found. Switching to DEMO mode.")
-        simulation_thread()
+        print("Scapy not available. Sniffer cannot start.")
+        state.status = "MISSING_DEPS"
         return
 
     try:
         print(f"--- 🕵️ SENTINEL ACTIVE ON: {conf.iface} ---")
         sniff(prn=real_packet_callback, store=0)
     except Exception as e:
-        print(f"Sniffer failed ({e}). Switching to DEMO mode.")
-        simulation_thread()
+        print(f"Sniffer failed: {e}")
+        state.status = "SNIFFER_ERROR"
 
 def real_packet_callback(packet):
     features = extract_features(packet)
@@ -169,31 +198,6 @@ def real_packet_callback(packet):
     }
     process_data(features, summary)
 
-def simulation_thread():
-    state.mode = "DEMO"
-    print("--- 🎮 DEMO MODE ACTIVE ---")
-    while not state.stop_signal:
-        time.sleep(random.uniform(0.1, 0.5))
-        
-        # Generate Fake Features
-        is_attack = random.random() < 0.1
-        if is_attack:
-             pkt_len = int(random.uniform(200, 1100))
-             proto = 17; is_dns = 0
-        else:
-             pkt_len = int(random.normalvariate(800, 200)) + 54
-             proto = 6; is_dns = 0
-        
-        features = [pkt_len, proto, is_dns, max(0, pkt_len - 54)]
-        
-        summary = {
-            "time": time.strftime("%H:%M:%S"),
-            "src": f"192.168.1.{random.randint(2, 254)}",
-            "dst": f"10.0.0.{random.randint(2, 254)}",
-            "proto": "UDP" if proto == 17 else "TCP",
-            "size": int(pkt_len)
-        }
-        process_data(features, summary)
 
 # --- ROUTES ---
 from lib.templates import HTML_DASHBOARD
