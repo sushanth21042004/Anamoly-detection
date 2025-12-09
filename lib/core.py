@@ -4,19 +4,23 @@ import sys
 import os
 import time
 import random
-import math
+import numpy as np
 from collections import deque
 from flask import Flask, jsonify, render_template_string
 
-# --- NO HEAVY DEPENDENCIES (Pure Python) ---
+# --- ML IMPORTS (Standard) ---
+try:
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.preprocessing import StandardScaler
+except ImportError:
+    pass
 
 # --- SCAPY (Optional - Local Only) ---
 SCAPY_AVAILABLE = False
 try:
-    # Only try to import if not on Vercel to save time
-    if not os.environ.get('VERCEL'):
-        from scapy.all import sniff, IP, TCP, UDP, DNS, conf
-        SCAPY_AVAILABLE = True
+    # Render might not have permissions for raw sockets, but we can try
+    from scapy.all import sniff, IP, TCP, UDP, DNS, conf
+    SCAPY_AVAILABLE = True
 except Exception:
     pass
 
@@ -42,154 +46,11 @@ class AppState:
 state = AppState()
 app = Flask(__name__)
 
-# --- PURE PYTHON MACHINE LEARNING (Zero Deps) ---
-
-class SimpleScaler:
-    def __init__(self):
-        self.mean = []
-        self.scale = []
-
-    def fit_transform(self, X):
-        # Calculate mean and std dev manually
-        if not X: return []
-        n_samples = len(X)
-        n_features = len(X[0])
-        
-        self.mean = [0.0] * n_features
-        self.scale = [0.0] * n_features
-        
-        # Mean
-        for row in X:
-            for i in range(n_features):
-                self.mean[i] += row[i]
-        self.mean = [m / n_samples for m in self.mean]
-        
-        # Std Dev
-        for row in X:
-            for i in range(n_features):
-                self.scale[i] += (row[i] - self.mean[i]) ** 2
-        self.scale = [math.sqrt(s / n_samples) if s > 0 else 1.0 for s in self.scale]
-        
-        return self.transform(X)
-
-    def transform(self, X):
-        X_new = []
-        for row in X:
-            new_row = []
-            for i, val in enumerate(row):
-                if self.scale[i] > 0:
-                    new_row.append((val - self.mean[i]) / self.scale[i])
-                else:
-                    new_row.append(0.0)
-            X_new.append(new_row)
-        return X_new
-
-class SimpleDecisionTree:
-    def __init__(self, max_depth=5):
-        self.max_depth = max_depth
-        self.tree = None
-
-    def fit(self, X, y):
-        self.tree = self._build_tree(X, y, depth=0)
-
-    def _gini(self, y):
-        if not y: return 0
-        m = len(y)
-        return 1.0 - sum((y.count(c)/m)**2 for c in set(y))
-
-    def _build_tree(self, X, y, depth):
-        num_samples = len(y)
-        if num_samples <= 1 or depth >= self.max_depth:
-            # Leaf: return class probabilities
-            counts = {c: y.count(c) for c in set(y)}
-            total = sum(counts.values())
-            return {c: counts[c]/total for c in counts}
-
-        # Simplified split finding (Random feature selection for speed)
-        best_gain = -1
-        best_split = None
-        current_gini = self._gini(y)
-        
-        n_features = len(X[0])
-        # Try a few random features and thresholds
-        for _ in range(10): 
-            feat_idx = random.randint(0, n_features - 1)
-            thresh = X[random.randint(0, num_samples-1)][feat_idx]
-            
-            left_idx = [i for i in range(num_samples) if X[i][feat_idx] < thresh]
-            right_idx = [i for i in range(num_samples) if X[i][feat_idx] >= thresh]
-            
-            if not left_idx or not right_idx: continue
-            
-            y_left = [y[i] for i in left_idx]
-            y_right = [y[i] for i in right_idx]
-            
-            gini_left = self._gini(y_left)
-            gini_right = self._gini(y_right)
-            
-            gain = current_gini - (len(y_left)/num_samples * gini_left + len(y_right)/num_samples * gini_right)
-            
-            if gain > best_gain:
-                best_gain = gain
-                best_split = (feat_idx, thresh, left_idx, right_idx)
-
-        if best_gain > 0:
-            feat, thresh, l_idx, r_idx = best_split
-            return {
-                'feat': feat,
-                'thresh': thresh,
-                'left': self._build_tree([X[i] for i in l_idx], [y[i] for i in l_idx], depth+1),
-                'right': self._build_tree([X[i] for i in r_idx], [y[i] for i in r_idx], depth+1)
-            }
-        
-        # Failed to split, make leaf
-        counts = {c: y.count(c) for c in set(y)}
-        total = sum(counts.values())
-        return {c: counts[c]/total for c in counts}
-
-    def predict_proba(self, sample):
-        node = self.tree
-        while isinstance(node, dict) and 'feat' in node:
-            if sample[node['feat']] < node['thresh']:
-                node = node['left']
-            else:
-                node = node['right']
-        # Node matches class probabilities
-        return node.get(1, 0.0) # Return prob of class 1 (Anomaly)
-
-class SimpleRandomForest:
-    def __init__(self, n_estimators=10):
-        self.trees = []
-        self.n_estimators = n_estimators
-
-    def fit(self, X, y):
-        self.trees = []
-        for _ in range(self.n_estimators):
-            # Bootstrap sample
-            indices = [random.randint(0, len(X)-1) for _ in range(len(X))]
-            X_sample = [X[i] for i in indices]
-            y_sample = [y[i] for i in indices]
-            
-            tree = SimpleDecisionTree(max_depth=5)
-            tree.fit(X_sample, y_sample)
-            self.trees.append(tree)
-
-    def predict_proba(self, X):
-        # Only returns prob of class 1 for each sample
-        results = []
-        for sample in X:
-            total_prob = 0.0
-            for tree in self.trees:
-                total_prob += tree.predict_proba(sample)
-            results.append([1.0 - (total_prob/len(self.trees)), total_prob/len(self.trees)])
-        return results
-
-
-# --- INTERNAL TRAINING ENGINE (Pure Python) ---
-def train_tiny_model():
-    print("--- 🧠 INITIALIZING AI (Pure Python Mode) ---")
+# --- INTERNAL TRAINING ENGINE (Standard Sklearn) ---
+def train_model():
+    print("--- 🧠 INITIALIZING AI (Standard Sklearn) ---")
     
-    # Tiny dataset
+    # Tiny dataset (50 samples) -> Fast startup
     X = []
     y = []
     
@@ -201,18 +62,18 @@ def train_tiny_model():
         X.append([random.randint(20, 1000), 17, 0, 50])
         y.append(1)
 
-    scaler = SimpleScaler()
+    scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
     
-    clf = SimpleRandomForest(n_estimators=5)
+    clf = RandomForestClassifier(n_estimators=10, max_depth=5, random_state=42)
     clf.fit(X_scaled, y)
     
-    print("[✓] Zero-Dep Model Initialized.")
+    print("[✓] AI Model Initialized.")
     return clf, scaler
 
 # --- INITIALIZE ON IMPORT ---
 try:
-    state.model, state.scaler = train_tiny_model()
+    state.model, state.scaler = train_model()
     state.status = "ACTIVE"
 except Exception as e:
     print(f"[!] Init Failed: {e}")
@@ -221,9 +82,7 @@ except Exception as e:
 # --- FEATURE ENGINEERING ---
 def extract_features(packet):
     try:
-        # Check packet type (Scapy object)
         if not SCAPY_AVAILABLE: return None
-
         if IP not in packet: return None
         pkt_len = len(packet)
         proto = packet[IP].proto
@@ -242,12 +101,8 @@ def process_data(features, summary_info):
     with state.lock:
         state.packet_count += 1
 
-    # Transform single sample
-    # SimpleScaler expects list of lists
-    X_input = [features] 
+    X_input = np.array([features])
     X_scaled = state.scaler.transform(X_input)
-    
-    # Predict
     probs = state.model.predict_proba(X_scaled)[0]
     risk_score = probs[1] 
     is_anomaly = bool(risk_score > 0.85)
@@ -301,6 +156,12 @@ def real_packet_callback(packet):
     }
     process_data(features, summary)
 
+# --- BACKGROUND WORKER LAUNCHER ---
+# For Render: We need to start the sniffer thread when the app starts
+# Since Gunicorn spawns workers, we can place this in the main block or a pre-request hook
+# But for simplicity, we keep the endpoint-based start or auto-start if possible.
+# Ideally, user hits /api/start or we auto-start. 
+# Let's auto-start on first request or just let user click button.
 
 # --- ROUTES ---
 from lib.templates import HTML_DASHBOARD
