@@ -1,4 +1,4 @@
-from lib.core import app, load_ai_model, sniffer_thread
+from lib.core import app, sniffer_thread
 import threading
 import sys
 import os

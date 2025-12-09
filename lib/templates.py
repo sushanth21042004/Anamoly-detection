@@ -457,3 +457,4 @@ HTML_DASHBOARD = """
     </script>
 </body>
 </html>
+"""
